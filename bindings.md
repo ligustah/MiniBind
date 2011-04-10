@@ -3,6 +3,7 @@ module bindings
 import io
 import os
 import math
+import stream
 
 class Buffer : StringBuffer
 {
@@ -48,7 +49,7 @@ function myReduce(arr : array, start, func : function)
 	return arr.reduce(func)
 }
 
-class GenInit
+class GenClassInit
 {
 	cl
 	
@@ -92,6 +93,11 @@ class GenCtors
 	{
 		:cl = cl
 		:ctors = ctors
+		if(!#:ctors)
+		{
+			//writefln $ "warning: no explicit constructor for {}", :cl.name
+			:ctors ~= { type = format("{}()", :cl.name) }
+		}
 		:ctors.each(\i,c{
 			c.params = paramsOf(c.type)
 		})
@@ -99,21 +105,37 @@ class GenCtors
 	
 	function generate(b : Buffer)
 	{
-		local ctor = :ctors[0]
 		b $ ""
 		b $ "uword constructor(MDThread* t)"
 		b $ "{"
 		b.tab(1)
 			b $ "auto numParams = stackSize(t) - 1;"
 			b $ format $ "checkInstParam(t, 0, \"{}\");", :cl.name
+			b $ format $ "{} inst;", :cl.name
 			b $ ""
-			b $ "// getting parameters"
-			foreach(i, param; ctor.params)
+			foreach(ctor; :ctors)
 			{
-				b $ format $ "{} {} = superGet!({0})(t, {});", param.type, param.name, i + 1
+				if(#ctor.params)
+					b $ format $ "if(numParams == {} && TypesMatch!({})(t))", #ctor.params, string.joinArray(ctor.params.map(\p->p.type), ", ")
+				else
+					b $ "if(numParams == 0)"
+				b $ "{"
+				b.tab(1)
+					if(#ctor.params)
+					{
+						b $ "// getting parameters"
+						foreach(i, param; ctor.params)
+						{
+							b $ format $ "{} {} = superGet!({0})(t, {});", param.type, param.name, i + 1
+						}
+						b $ ""
+					}
+					b $ format $ "inst = new {}({});", :cl.name, string.joinArray(ctor.params.map(\p->p.name), ", ")
+				b.tab(-1)
+				b $ "}"
+				b $ ""
 			}
-			b $ ""
-			b $ format $ "{} inst = new {0}({});", :cl.name, string.joinArray(ctor.params.map(\p->p.name), ", ")
+			b $ "if(inst is null) throwException(t, \"No such constructor\");"
 			b $ "pushNativeObj(t, inst);"
 			b $ "setExtraVal(t, 0, 0);"
 			b $ "setWrappedInstance(t, inst, 0);"
@@ -147,10 +169,13 @@ class GenFuncs
 			b $ "{"
 			b.tab(1)
 				b $ format $ "{} inst = getThis(t);", :cl.name
-				b $ ""
-				foreach(i, param; f.params)
+				if(#f.params)
 				{
-					b $ format $ "{} {} = superGet!({0})(t, {});", param.type, param.name, i + 1
+					b $ ""
+					foreach(i, param; f.params)
+					{
+						b $ format $ "{} {} = superGet!({0})(t, {});", param.type, param.name, i + 1
+					}
 				}
 				b $ ""
 				b $ "//call the function"
@@ -177,18 +202,21 @@ class GenClass
 	funcs
 	ctors
 	init
+	symbol
 		
 	this(name : string, members : array)
 	{
 		:name = name
+		:symbol = :name ~ "Obj"
 		:ctors = GenCtors(this, members.filter $ \i,v->v.kind == "constructor")
 		:funcs = GenFuncs(this, members.filter $ \i,v->v.kind == "function")
-		:init = GenInit(this)
+		:init = GenClassInit(this)
 	}
 	
 	function generate(b : Buffer)
 	{
-		b $ format $ "struct {}Obj", :name
+		b $ ""
+		b $ format $ "struct {}", :symbol
 		b $ "{"
 		b $ "static:"
 		b.tab $ 1
@@ -204,6 +232,103 @@ class GenClass
 			
 		b.tab $ -1
 		b $ "}"
+	}
+}
+
+class GenEnum
+{
+	name
+	base
+	symbol
+	members
+	
+	this(name : string, base : string, members : array)
+	{
+		:name = name
+		:base = base
+		:symbol = name ~ "Enum"
+		:members = members.filter(\i,v->v.kind == "enum member");
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ ""
+		b $ format $ "struct {}", :symbol
+		b $ "{"
+		b $ "static:"
+		b.tab(1)
+			b $ "void init(MDThread* t)"
+			b $ "{"
+			b.tab(1)
+				b $ format $ "newNamespace(t, \"{}\");", :name
+				b $ ""
+				foreach(mem; :members)
+				{
+					b $ format $ "pushInt(t, {}.{}); fielda(t, -2, \"{1}\");", :name, mem.name
+				}
+				b $ ""
+				b $ format $ "newGlobal(t, \"{}\");", :name
+			b.tab(-1)
+			b $ "}"
+		b.tab(-1)
+		b $ "}"
+	}
+}
+
+class GenModuleInit
+{
+	mod
+	
+	this(mod : GenModule)
+	{
+		:mod = mod
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ "void init(MDThread* t)"
+		b $ "{"
+		b.tab(1)
+			foreach(gen; :mod.generators)
+				b $ format $ "{}.init(t);", gen.symbol
+		b.tab(-1)
+		b $ "}"
+	}
+}
+
+class GenModule
+{
+	generators
+	init
+	
+	this(mod : table)
+	{
+		:generators = []
+		:init = GenModuleInit(this)
+		
+		foreach(mem; mod.members)
+		{
+			switch(mem.kind)
+			{
+				case "class":
+					:generators ~= GenClass(mem.name, mem.members)
+					break
+				case "enum":
+					:generators ~= GenEnum(mem.name, mem.base, mem.members)
+				default:
+					continue
+			}
+		}
+	}
+	
+	function generate(b : Buffer)
+	{
+		:init.generate(b)
+		
+		foreach(gen; :generators)
+		{
+			gen.generate(b)
+		}
 	}
 }
 
@@ -279,17 +404,9 @@ function main(filename = null, vararg)
 		return -1
 	}
 	local tab = getJSON(filename)[0]
-	local i = 0
 	
-	foreach(mem; tab.members)
-	{
-		writeln $ mem
-		if(mem.kind != "class") continue
-		
-		local t = GenClass(mem.name, mem.members)
-		
-		t.generate(buf)
-			
-		writeln $ buf.toString()
-	}
+	local mod = GenModule(tab)
+	
+	mod.generate(buf)
+	writeln $ buf.toString()
 }
