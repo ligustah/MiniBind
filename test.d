@@ -20,6 +20,12 @@ private void _init(MDThread* t)
 		pop(t, 2);
 }
 
+enum Test : byte
+{
+	A,
+	B,
+	C
+}
 class TestClass
 {
 	private char[] _text;
@@ -29,11 +35,42 @@ class TestClass
 		this._text = test;
 	}
 	
+	this()
+	{
+		this._text = "default";
+	}
+	
+	this(char[] a, char[] b)
+	{
+		this._text = a ~ b;
+	}
+	
 	public int test()
 	{
 		Stdout(_text).newline;
 		
 		return _text.length;
+	}
+}
+
+void init(MDThread* t)
+{
+	TestEnum.init(t);
+	TestClassObj.init(t);
+}
+
+struct TestEnum
+{
+static:
+	void init(MDThread* t)
+	{
+		newNamespace(t, "Test");
+		
+		pushInt(t, Test.A); fielda(t, -2, "A");
+		pushInt(t, Test.B); fielda(t, -2, "B");
+		pushInt(t, Test.C); fielda(t, -2, "C");
+		
+		newGlobal(t, "Test");
 	}
 }
 
@@ -49,11 +86,31 @@ static:
 	{
 		auto numParams = stackSize(t) - 1;
 		checkInstParam(t, 0, "TestClass");
+		TestClass inst;
 		
-		// getting parameters
-		char[] test = superGet!(char[])(t, 1);
+		if(numParams == 1 && TypesMatch!(char[])(t))
+		{
+			// getting parameters
+			char[] test = superGet!(char[])(t, 1);
+			
+			inst = new TestClass(test);
+		}
 		
-		TestClass inst = new TestClass(test);
+		if(numParams == 0)
+		{
+			inst = new TestClass();
+		}
+		
+		if(numParams == 2 && TypesMatch!(char[], char[])(t))
+		{
+			// getting parameters
+			char[] a = superGet!(char[])(t, 1);
+			char[] b = superGet!(char[])(t, 2);
+			
+			inst = new TestClass(a, b);
+		}
+		
+		if(inst is null) throwException(t, "No such constructor");
 		pushNativeObj(t, inst);
 		setExtraVal(t, 0, 0);
 		setWrappedInstance(t, inst, 0);
@@ -64,7 +121,6 @@ static:
 	{
 		TestClass inst = getThis(t);
 		
-		
 		//call the function
 		int returns = inst.test();
 		superPush!(int)(t, returns);
@@ -73,8 +129,6 @@ static:
 	
 	void init(MDThread* t)
 	{
-		_init(t);
-		
 		CreateClass(t, "TestClass", (CreateClass* c)
 		{
 			c.method("constructor", &constructor);
@@ -84,29 +138,39 @@ static:
 		
 		newFunction(t, &BasicClassAllocator!(1, 0), "TestClass.allocator");
 		setAllocator(t, -2);
-
+		
 		setWrappedClass(t, typeid(TestClass));
 		newGlobal(t, "TestClass");
 	}
 }
 
+char[][] testcases = 
+[
+	"local t = TestClass(\"single string\"); t.test()",
+	"local t = TestClass(\"ab\", \"c\"); t.test()",
+	"local t = TestClass(); t.test()",
+	"local t = TestClass(5); t.test()"
+];
+
 void main()
 {
-	auto test = new TestClass("blubb");
+	auto test = new TestClass("native instance");
 	
 	test.test();
 	
 	MDVM vm;
 	auto t = openVM(&vm);
 	
-	TestClassObj.init(t);
+	_init(t);
+	init(t);
 	
 	loadString(t, "vararg[0].test()");
 	pushNull(t);
 	superPush(t, test);
 	rawCall(t, -3, 0);
 	
-	runString(t, "local t = TestClass(\"moep\"); t.test()");
+	foreach(c; testcases)
+		runString(t, c);
 	
 	closeVM(&vm);
 }
