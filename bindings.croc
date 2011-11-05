@@ -1,0 +1,538 @@
+module bindings
+
+import io
+import os
+import math
+import stream
+import string : StringBuffer
+import json : fromJSON
+
+class Buffer : StringBuffer
+{
+	ind = 0
+	
+	function tab(by : int)
+	{
+		:ind += math.sign(by)
+	}
+	
+	function opCall(text, vararg)
+	{
+		try
+		{
+			if(text == "}") :tab $ -1
+			:append("\t".repeat(:ind))
+			:append(#vararg ? format(text, vararg) : text)
+			:append("\r\n")
+			if(text == "{") :tab $ 1
+		}catch(e : Exception)
+		{
+			writeln $ :toString()
+			throw e
+		}
+	}
+}
+
+function paramsOf(t)
+{
+	local type = t[t.find("(") + 1 .. #t - 1]
+	
+	if(!#type)
+		return []
+	
+	local types = type.split(",")
+	types.apply(\v->v.strip())
+	types.apply(\v->v.split())
+	types.apply(\v->{type = v[0], name = v[1]})
+	return types
+}
+
+function returnTypeOf(t)
+{
+	return t[0..t.find("(")]
+}
+
+function myReduce(arr : array, start, func : function)
+{
+	if(!#arr)
+		arr = [start] ~ arr
+	
+	return arr.reduce(func)
+}
+
+class GenClassInit
+{
+	cl
+	
+	this(cl : GenClass)
+	{
+		:cl = cl
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ ""
+		b $ "void init(CrocThread* t)"
+		b $ "{"
+			b $ "CreateClass(t, \"{}\", (CreateClass* c)", :cl.name
+			b $ "{"
+				b $ "c.method(\"constructor\", &constructor);"
+				if(#:cl.funcs.funcs)
+				{
+					b $ ""
+					b $ "//methods"
+					foreach(f; :cl.funcs.funcs)
+						b $ "c.method(\"{}\", &{0});", f.name
+				}
+				if(#:cl.props.props)
+				{
+					b $ ""
+					b $ "//properties"
+					foreach(f; :cl.props.props)
+						b $ "c.method(\"_prop_{}\", &_prop_{0});", f.name
+					b $ "c.method(\"opField\", &opField);"
+					b $ "c.method(\"opFieldAssign\", &opFieldAssign);"
+				}
+			b.tab(-1)
+			b $ "});"
+			b $ ""
+			b $ "newFunction(t, &BasicClassAllocator!(1, 0), \"{}.allocator\");", :cl.name
+			b $ "setAllocator(t, -2);"
+			b $ ""
+			b $ "setWrappedClass(t, typeid({}));", :cl.name
+			b $ "newGlobal(t, \"{}\");", :cl.name
+		b $ "}"
+	}
+}
+
+class GenCtors
+{
+	cl
+	ctors
+	
+	this(cl : GenClass, ctors : array)
+	{
+		:cl = cl
+		:ctors = ctors
+		if(!#:ctors)
+		{
+			//writefln $ "warning: no explicit constructor for {}", :cl.name
+			:ctors ~= { type = format("{}()", :cl.name) }
+		}
+		:ctors.each(\i,c{
+			c.params = paramsOf(c.type)
+		})
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ ""
+		b $ "uword constructor(CrocThread* t)"
+		b $ "{"
+			b $ "auto numParams = stackSize(t) - 1;"
+			b $ "checkInstParam(t, 0, \"{}\");", :cl.name
+			b $ "{} inst;", :cl.name
+			b $ ""
+			foreach(ctor; :ctors)
+			{
+				if(#ctor.params)
+					b $ "if(numParams == {} && TypesMatch!({})(t))", #ctor.params, string.joinArray(ctor.params.map(\p->p.type), ", ")
+				else
+					b $ "if(numParams == 0)"
+				b $ "{"
+					if(#ctor.params)
+					{
+						b $ "// getting parameters"
+						foreach(i, param; ctor.params)
+						{
+							b $ "{} {} = superGet!({0})(t, {});", param.type, param.name, i + 1
+						}
+						b $ ""
+					}
+					b $ "inst = new {}({});", :cl.name, string.joinArray(ctor.params.map(\p->p.name), ", ")
+				b $ "}"
+				b $ ""
+			}
+			b $ "if(inst is null) throwStdException(t, \"MethodException\", \"No such constructor\");"
+			b $ "pushNativeObj(t, inst);"
+			b $ "setExtraVal(t, 0, 0);"
+			b $ "setWrappedInstance(t, inst, 0);"
+			b $ "return 0;"
+		b $ "}"
+	}
+}
+
+class GenProps
+{
+	cl
+	props
+	
+	this(cl : GenClass, func : array)
+	{
+		:cl = cl
+		:props = {}
+		
+		foreach(f; func)
+		{
+			if(!#f.params && f.returns != "void")
+			{
+				//this will become a getter property
+				f.kind = "prop"
+				//find all setter functions for this getter
+				f.setter = func.filter $ \i,v -> v.name == f.name && #v.params == 1 && v.returns == "void"
+				foreach(s; f.setter) s.kind = "setter"
+				:props[f.name] = f
+			}
+			/*
+			else if(#f.params == 1 && f.returns == "void")
+			{
+				//this might become a setter property
+				f.kind = "setter_prop"
+			}
+			*/
+		}
+	}
+	
+	function has()
+	{
+		return toBool(#:props)
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ ""
+		b $ "uword opField(CrocThread* t)"
+		b $ "{"
+			b $ "auto fieldName = checkStringParam(t, 1);"
+			b $ "switch(fieldName)"
+			b $ "{"
+				b $ "default:"
+				b $ "\tthrowStdException(t, `FieldException`, `Attempting to access nonexistent field '{{}' from type {}`, fieldName);", :cl.name
+				foreach(k,v; :props)
+				{
+					b $ ""
+					b $ "case \"{}\":", v.name
+					b.tab $ 1
+						b $ "dup(t, 0);"
+						b $ "pushNull(t);"
+						b $ "methodCall(t, -2, `_prop_{}`, 1);", v.name
+						b $ "break;"
+					b.tab $ -1
+				}
+			b $ "}"
+			b $ "return 1;"
+		b $ "}"
+		b $ ""
+		b $ "uword opFieldAssign(CrocThread* t)"
+		b $ "{"
+			b $ "auto fieldName = checkStringParam(t, 1);"
+			b $ "switch(fieldName)"
+			b $ "{"
+				b $ "default:"
+				b $ "\tthrowStdException(t, `FieldException`, `Attempting to access nonexistent field '{{}' from type {}`, fieldName);", :cl.name
+				foreach(k,v; :props)
+				{
+					b $ ""
+					b $ "case \"{}\":", v.name
+					b.tab $ 1
+						b $ "dup(t, 0);"
+						b $ "pushNull(t);"
+						b $ "dup(t, 2);"
+						b $ "methodCall(t, -3, `_prop_{}`, 0);", v.name
+						b $ "break;"
+					b.tab $ -1
+				}
+			b $ "}"
+			b $ "return 0;"
+		b $ "}"
+		//generate the _prop_name methods
+		foreach(k,v; :props)
+		{
+			b $ ""
+			b $ "uword _prop_{}(CrocThread* t)", v.name
+			b $ "{"
+				b $ "auto numParams = stackSize(t) - 1;"
+				b $ "{} inst = getThis(t);", :cl.name
+				b $ "if(numParams == 0)"
+				b $ "{"
+					b $ "superPush(t, inst.{});", v.name
+					b $ "return 1;"
+				b $ "}"
+				if(!#v.setter)
+				{
+					b $ "throwStdException(t, \"FieldException\", \"Attempting to set read-only property '{}' of type '{}'\");", v.name, v.returns
+				}
+				else
+				{
+					foreach(set; v.setter)
+					{
+						local t = paramsOf(set.type)[0] //there is only one param for setters
+						b $ "if(TypesMatch!({})(t))", t.type
+						b $ "{"
+							b $ "{} {} = superGet!({0})(t, 1);", t.type, t.name
+							b $ "safeCode(t, inst.{} = {});", set.name, t.name
+							b $ "return 0;"
+						b $ "}"
+					}
+				}
+			b $ "}"
+		}
+	}
+}
+
+class GenFuncs
+{
+	cl
+	funcs
+	
+	this(cl : GenClass, funcs : array)
+	{
+		:cl = cl
+		:funcs = funcs
+	}
+	
+	function generate(b : Buffer)
+	{
+		foreach(f; :funcs)
+		{
+			b $ ""
+			b $ "uword {}(CrocThread* t)", f.name
+			b $ "{"
+				b $ "{} inst = getThis(t);", :cl.name
+				if(#f.params)
+				{
+					b $ ""
+					foreach(i, param; f.params)
+					{
+						b $ "{} {} = superGet!({0})(t, {});", param.type, param.name, i + 1
+					}
+				}
+				b $ ""
+				b $ "//call the function"
+				if(f.returns == "void")
+				{
+					b $ "inst.{}({});", f.name, string.joinArray(f.params.map(\p->p.name), ",")
+					b $ "return 0;"
+				}
+				else
+				{
+					b $ "{} returns = inst.{}({});", f.returns, f.name, string.joinArray(f.params.map(\p->p.name), ",")
+					b $ "superPush!({})(t, returns);", f.returns
+					b $ "return 1;"
+				}
+			b $ "}"
+		}
+	}
+}
+
+class GenClass
+{
+	name
+	funcs
+	ctor
+	props
+	init
+	symbol
+		
+	this(name : string, members : array)
+	{
+		:name = name
+		:symbol = :name ~ "Obj"
+		
+		local fun = members.filter $ \i,v->v.kind == "function"
+		fun.each(\i,c{
+			c.params = paramsOf(c.type)
+			c.returns = returnTypeOf(c.type)
+		})
+		
+		:ctors = GenCtors(this, members.filter $ \i,v->v.kind == "constructor")
+		:props = GenProps(this, fun) //this must be done before GenFuncs!!
+		:funcs = GenFuncs(this, fun.filter $ \i,v->v.kind == "function")
+		:init = GenClassInit(this)
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ ""
+		b $ "struct {}", :symbol
+		b $ "{"
+			b $ "static:"
+			b $ "private {} getThis(CrocThread* t)", :name
+			b $ "{"
+				b $ "return cast({})getNativeObj(t, getExtraVal(t, 0, 0));", :name
+			b $ "}"
+			:ctors.generate(b)
+			:funcs.generate(b)
+			:props.generate(b)
+			:init.generate(b)
+		b $ "}"
+	}
+}
+
+class GenEnum
+{
+	name
+	base
+	symbol
+	members
+	
+	this(name : string, base : string, members : array)
+	{
+		:name = name
+		:base = base
+		:symbol = name ~ "Enum"
+		:members = members.filter(\i,v->v.kind == "enum member");
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ ""
+		b $ "struct {}", :symbol
+		b $ "{"
+			b $ "static:"
+			b $ "void init(CrocThread* t)"
+			b $ "{"
+				b $ "newNamespace(t, \"{}\");", :name
+				b $ ""
+				foreach(mem; :members)
+				{
+					b $ "pushInt(t, {}.{}); fielda(t, -2, \"{1}\");", :name, mem.name
+				}
+				b $ ""
+				b $ "newGlobal(t, \"{}\");", :name
+			b $ "}"
+		b $ "}"
+	}
+}
+
+class GenModuleInit
+{
+	mod
+	
+	this(mod : GenModule)
+	{
+		:mod = mod
+	}
+	
+	function generate(b : Buffer)
+	{
+		b $ "void init(CrocThread* t)"
+		b $ "{"
+			foreach(gen; :mod.generators)
+				b $ "{}.init(t);", gen.symbol
+		b $ "}"
+	}
+}
+
+class GenModule
+{
+	generators
+	init
+	
+	this(mod : table)
+	{
+		:generators = []
+		:init = GenModuleInit(this)
+		
+		foreach(mem; mod.members)
+		{
+			switch(mem.kind)
+			{
+				case "class":
+					:generators ~= GenClass(mem.name, mem.members)
+					break
+				case "enum":
+					:generators ~= GenEnum(mem.name, mem.base, mem.members)
+				default:
+					continue
+			}
+		}
+	}
+	
+	function generate(b : Buffer)
+	{
+		:init.generate(b)
+		
+		foreach(gen; :generators)
+		{
+			gen.generate(b)
+		}
+	}
+}
+
+local randomStringPool = [toChar(x) for x; 0 .. 128 if toChar(x).isAlNum()]
+
+local function randomString(len : int = 10)
+{	
+	local buf = StringBuffer()
+	for(i : 0 .. len)
+	{
+		buf.append(randomStringPool[math.rand(#randomStringPool)])
+	}
+	return buf.toString()
+}
+
+function whereis(prog, checkExts : bool = false)
+{
+	local path = os.getEnv("PATH")
+	local exts = ["exe", "bat"]
+	
+	foreach(p; path.split(";"))
+	{
+		foreach(ext; exts)
+		{
+			local fp = io.join(p, format("{}.{}", prog, ext))
+			if(io.exists $ fp)
+				return fp
+		}
+	}
+}
+
+function getJSON(filename)
+{
+	local tmpFile = randomString() ~ ".json"
+	local args = []
+	args ~= whereis("dmd")
+	args ~= "-X"
+	args ~= format $ "-Xf{}", tmpFile
+	args ~= "-c"
+	args ~= "-o-"
+	args ~= "-I..\\Croc"
+	args ~= filename
+	
+	local proc = os.Process()
+	
+	writefln $ "running {}", args
+	proc.execute(args, os.getEnv())
+	local reason, code = proc.wait()
+	
+	if(code)
+	{
+		throw "compiler error"
+	}
+	
+	//writeln $ io.readFile $ tmpFile
+	
+	local json = fromJSON $ io.readFile $ tmpFile
+	
+	io.remove(tmpFile)
+	
+	return json
+}
+
+function main(filename = null, vararg)
+{
+	local buf = Buffer()
+	
+	if(!io.exists(filename))
+	{
+		writeln $ "Error: file does not exist"
+		return -1
+	}
+	local tab = getJSON(filename)[0]
+	
+	local mod = GenModule(tab)
+	
+	mod.generate(buf)
+	writeln $ buf.toString()
+}
